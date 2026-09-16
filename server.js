@@ -1,186 +1,430 @@
 const express = require("express");
-const path = require("path");
-const Database = require("better-sqlite3");
+const session = require("express-session");
 const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const cookieParser = require("cookie-parser");
+const Database = require("better-sqlite3");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET_FOR_PRODUCTION";
+
+app.set("trust proxy", 1);
+
 const db = new Database(path.join(__dirname, "attendance.db"));
 
 db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS students (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL COLLATE NOCASE,
-  roll_number TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  student_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  roll_number TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
 CREATE TABLE IF NOT EXISTS attendance (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  attendance_id INTEGER PRIMARY KEY AUTOINCREMENT,
   student_id INTEGER NOT NULL,
-  attendance_date TEXT NOT NULL,
+  date TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('Present','Absent')),
-  marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
-  UNIQUE(student_id, attendance_date)
+  marked_time TEXT NOT NULL,
+  FOREIGN KEY(student_id) REFERENCES students(student_id),
+  UNIQUE(student_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS admins (
+  admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL
 );
 `);
 
-function seed() {
-  const count = db.prepare("SELECT COUNT(*) AS c FROM students").get().c;
-  if (count === 0) {
-    const add = db.prepare("INSERT INTO students(name, roll_number, password_hash) VALUES(?,?,?)");
-    add.run("Manikanta", "23A81A0501", bcrypt.hashSync("23A81A0501", 10));
-    add.run("Jaswanth", "23A81A0502", bcrypt.hashSync("23A81A0502", 10));
-  }
-  const adminExists = db.prepare("SELECT id FROM students WHERE roll_number = ?").get("__ADMIN__");
-  if (!adminExists) {
-    // Admin is kept outside the students table through environment/default credentials.
+// Create default admin account if it does not exist.
+const admin = db
+  .prepare("SELECT admin_id FROM admins WHERE username=?")
+  .get("admin");
+
+if (!admin) {
+  db.prepare(
+    "INSERT INTO admins(username,password_hash) VALUES(?,?)"
+  ).run("admin", bcrypt.hashSync("admin123", 10));
+}
+
+// Demo students
+function seedStudent(name, roll) {
+  const exists = db
+    .prepare("SELECT student_id FROM students WHERE roll_number=?")
+    .get(roll);
+
+  if (!exists) {
+    db.prepare(
+      "INSERT INTO students(name,roll_number,password_hash) VALUES(?,?,?)"
+    ).run(name, roll, bcrypt.hashSync(roll, 10));
   }
 }
-seed();
 
+seedStudent("Manikanta", "23A81A0501");
+seedStudent("Jaswanth", "23A81A0502");
+
+// Middleware
 app.use(express.json());
-app.use(cookieParser());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(
+  session({
+    secret:
+      process.env.SESSION_SECRET ||
+      "change-this-secret-in-production",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 1000 * 60 * 60 * 8
+    }
+  })
+);
+
 app.use(express.static(path.join(__dirname, "public")));
 
-function sign(user) {
-  return jwt.sign({ id: user.id, name: user.name, roll: user.roll_number, role: "student" }, JWT_SECRET, { expiresIn: "7d" });
-}
-function auth(req, res, next) {
-  try {
-    const token = req.cookies.attendease;
-    if (!token) return res.status(401).json({ error: "Please login." });
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: "Session expired. Please login again." });
+// Authentication middleware
+function requireLogin(req, res, next) {
+  if (!req.session.user) {
+    return res.status(401).json({
+      error: "Please login."
+    });
   }
-}
-function admin(req, res, next) {
-  const u = req.cookies.admin_attendease;
-  if (u !== "1") return res.status(401).json({ error: "Admin login required." });
+
   next();
 }
-function validDate(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s);
-}
 
-app.post("/api/login", (req,res) => {
-  const name = String(req.body.name || "").trim();
-  const password = String(req.body.password || "");
-  if (!name || !password) return res.status(400).json({error:"Enter username and password."});
-  const user = db.prepare("SELECT * FROM students WHERE name = ?").get(name);
-  if (!user || !bcrypt.compareSync(password, user.password_hash))
-    return res.status(401).json({error:"Invalid username or password."});
-  res.cookie("attendease", sign(user), {httpOnly:true, sameSite:"lax", secure:false, maxAge:7*24*60*60*1000});
-  res.json({ok:true, user:{name:user.name, roll:user.roll_number}});
-});
-
-app.post("/api/admin-login", (req,res) => {
-  const name = String(req.body.name || "").trim();
-  const password = String(req.body.password || "");
-  const adminName = process.env.ADMIN_USER || "admin";
-  const adminPassword = process.env.ADMIN_PASSWORD || "admin123";
-  if (name === adminName && password === adminPassword) {
-    res.cookie("admin_attendease","1",{httpOnly:true,sameSite:"lax",secure:false,maxAge:7*24*60*60*1000});
-    return res.json({ok:true});
+function requireAdmin(req, res, next) {
+  if (
+    !req.session.user ||
+    req.session.user.role !== "admin"
+  ) {
+    return res.status(403).json({
+      error: "Admin access required."
+    });
   }
-  res.status(401).json({error:"Invalid admin login."});
-});
 
-app.post("/api/logout",(req,res)=>{
-  res.clearCookie("attendease"); res.clearCookie("admin_attendease"); res.json({ok:true});
-});
-
-function summary(studentId) {
-  const row = db.prepare(`
-    SELECT
-      COUNT(*) total,
-      COALESCE(SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END),0) present,
-      COALESCE(SUM(CASE WHEN status='Absent' THEN 1 ELSE 0 END),0) absent
-    FROM attendance WHERE student_id=?
-  `).get(studentId);
-  const percentage = row.total ? Number((row.present / row.total * 100).toFixed(2)) : 0;
-  return {...row, percentage};
+  next();
 }
 
-app.get("/api/me", auth, (req,res)=>{
-  const s = db.prepare("SELECT id,name,roll_number FROM students WHERE id=?").get(req.user.id);
-  if (!s) return res.status(401).json({error:"Student not found."});
-  res.json({user:{name:s.name,roll:s.roll_number}, summary:summary(s.id)});
+// Student attendance statistics
+function getStats(studentId) {
+  const row = db
+    .prepare(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(
+          CASE
+            WHEN status='Present' THEN 1
+            ELSE 0
+          END
+        ) AS present,
+        SUM(
+          CASE
+            WHEN status='Absent' THEN 1
+            ELSE 0
+          END
+        ) AS absent
+      FROM attendance
+      WHERE student_id=?
+    `)
+    .get(studentId);
+
+  const total = Number(row.total || 0);
+  const present = Number(row.present || 0);
+  const absent = Number(row.absent || 0);
+
+  const percentage = total
+    ? +(present / total * 100).toFixed(2)
+    : 0;
+
+  // Number of consecutive future classes needed
+  // to reach 75% attendance.
+  let needed = 0;
+
+  while (
+    total + needed > 0 &&
+    ((present + needed) / (total + needed)) * 100 < 75
+  ) {
+    needed++;
+  }
+
+  return {
+    total,
+    present,
+    absent,
+    percentage,
+    needed
+  };
+}
+
+// Validate YYYY-MM-DD date
+function validDate(date) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(date);
+}
+
+// =========================
+// LOGIN
+// =========================
+
+app.post("/api/login", (req, res) => {
+  const {
+    username,
+    password,
+    role
+  } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({
+      error: "Username and password are required."
+    });
+  }
+
+  // Admin login
+  if (role === "admin") {
+    const a = db
+      .prepare(
+        "SELECT * FROM admins WHERE username=?"
+      )
+      .get(username);
+
+    if (
+      !a ||
+      !bcrypt.compareSync(
+        password,
+        a.password_hash
+      )
+    ) {
+      return res.status(401).json({
+        error: "Invalid admin login."
+      });
+    }
+
+    req.session.user = {
+      role: "admin",
+      id: a.admin_id,
+      name: a.username
+    };
+
+    return res.json({
+      ok: true,
+      role: "admin"
+    });
+  }
+
+  // Student login
+  const s = db
+    .prepare(
+      `
+      SELECT *
+      FROM students
+      WHERE name=? COLLATE NOCASE
+         OR roll_number=?
+      `
+    )
+    .get(username, username);
+
+  if (
+    !s ||
+    !bcrypt.compareSync(
+      password,
+      s.password_hash
+    )
+  ) {
+    return res.status(401).json({
+      error: "Invalid name or roll number."
+    });
+  }
+
+  req.session.user = {
+    role: "student",
+    id: s.student_id,
+    name: s.name
+  };
+
+  res.json({
+    ok: true,
+    role: "student"
+  });
 });
 
-app.get("/api/my-attendance", auth, (req,res)=>{
-  const rows = db.prepare("SELECT attendance_date,status,marked_at FROM attendance WHERE student_id=? ORDER BY attendance_date DESC").all(req.user.id);
-  res.json({rows});
+// =========================
+// LOGOUT
+// =========================
+
+app.post("/api/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.json({
+      ok: true
+    });
+  });
 });
 
-app.post("/api/my-attendance", auth, (req,res)=>{
+// =========================
+// CURRENT USER
+// =========================
+
+app.get("/api/me", requireLogin, (req, res) => {
+  if (req.session.user.role === "admin") {
+    return res.json({
+      role: "admin",
+      name: req.session.user.name
+    });
+  }
+
+  const s = db
+    .prepare(
+      `
+      SELECT student_id,name,roll_number
+      FROM students
+      WHERE student_id=?
+      `
+    )
+    .get(req.session.user.id);
+
+  if (!s) {
+    return res.status(404).json({
+      error: "Student not found."
+    });
+  }
+
+  res.json({
+    role: "student",
+    student: s,
+    stats: getStats(s.student_id)
+  });
+});
+
+// =========================
+// STUDENT MARK ATTENDANCE
+// =========================
+
+app.post("/api/attendance", requireLogin, (req, res) => {
+  if (req.session.user.role !== "student") {
+    return res.status(403).json({
+      error: "Students only."
+    });
+  }
+
   const date = String(req.body.date || "");
   const status = String(req.body.status || "");
-  if (!validDate(date) || !["Present","Absent"].includes(status))
-    return res.status(400).json({error:"Invalid date or status."});
+
+  if (
+    !validDate(date) ||
+    !["Present", "Absent"].includes(status)
+  ) {
+    return res.status(400).json({
+      error: "Invalid attendance data."
+    });
+  }
+
+  // Prevent duplicate attendance for same student/date
+  const old = db
+    .prepare(
+      `
+      SELECT attendance_id
+      FROM attendance
+      WHERE student_id=? AND date=?
+      `
+    )
+    .get(
+      req.session.user.id,
+      date
+    );
+
+  if (old) {
+    return res.status(409).json({
+      error:
+        "Attendance is already marked for this date."
+    });
+  }
+
   try {
-    db.prepare("INSERT INTO attendance(student_id,attendance_date,status) VALUES(?,?,?)").run(req.user.id,date,status);
-    res.json({ok:true, summary:summary(req.user.id)});
-  } catch (e) {
-    if (String(e.message).includes("UNIQUE")) return res.status(409).json({error:"Attendance is already marked for this date."});
-    res.status(500).json({error:"Could not save attendance."});
+    db.prepare(
+      `
+      INSERT INTO attendance(
+        student_id,
+        date,
+        status,
+        marked_time
+      )
+      VALUES(?,?,?,?)
+      `
+    ).run(
+      req.session.user.id,
+      date,
+      status,
+      new Date().toISOString()
+    );
+
+    res.json({
+      ok: true,
+      stats: getStats(
+        req.session.user.id
+      )
+    });
+  } catch (error) {
+    // Extra protection against duplicate attendance
+    if (
+      String(error.message).includes("UNIQUE")
+    ) {
+      return res.status(409).json({
+        error:
+          "Attendance is already marked for this date."
+      });
+    }
+
+    res.status(500).json({
+      error: "Could not save attendance."
+    });
   }
 });
 
-app.get("/api/class-overview", auth, (req,res)=>{
-  const students = db.prepare("SELECT id,name,roll_number FROM students ORDER BY name").all();
-  res.json({students:students.map(s=>({name:s.name,roll:s.roll_number,...summary(s.id)}))});
-});
+// =========================
+// STUDENT ATTENDANCE HISTORY
+// =========================
 
-app.post("/api/change-password", auth, (req,res)=>{
-  const oldPassword=String(req.body.oldPassword||""), newPassword=String(req.body.newPassword||"");
-  if(newPassword.length<6) return res.status(400).json({error:"New password must be at least 6 characters."});
-  const s=db.prepare("SELECT * FROM students WHERE id=?").get(req.user.id);
-  if(!bcrypt.compareSync(oldPassword,s.password_hash)) return res.status(401).json({error:"Current password is incorrect."});
-  db.prepare("UPDATE students SET password_hash=? WHERE id=?").run(bcrypt.hashSync(newPassword,10),s.id);
-  res.json({ok:true});
-});
-
-app.get("/admin", (req,res)=>res.sendFile(path.join(__dirname,"public","admin.html")));
-
-app.get("/api/admin/students", admin, (req,res)=>{
-  const rows=db.prepare("SELECT id,name,roll_number,created_at FROM students ORDER BY name").all();
-  res.json({rows});
-});
-app.post("/api/admin/students", admin, (req,res)=>{
-  const name=String(req.body.name||"").trim(), roll=String(req.body.roll||"").trim(), password=String(req.body.password||roll);
-  if(!name||!roll||password.length<6) return res.status(400).json({error:"Name, roll number and a password of at least 6 characters are required."});
-  try {
-    db.prepare("INSERT INTO students(name,roll_number,password_hash) VALUES(?,?,?)").run(name,roll,bcrypt.hashSync(password,10));
-    res.json({ok:true});
-  } catch(e) {
-    if(String(e.message).includes("UNIQUE")) return res.status(409).json({error:"That roll number already exists."});
-    res.status(500).json({error:"Could not add student."});
+app.get("/api/attendance", requireLogin, (req, res) => {
+  if (req.session.user.role !== "student") {
+    return res.status(403).json({
+      error: "Students only."
+    });
   }
-});
-app.get("/api/admin/attendance", admin, (req,res)=>{
-  const rows=db.prepare(`SELECT a.id,a.attendance_date,a.status,a.marked_at,s.name,s.roll_number
-    FROM attendance a JOIN students s ON s.id=a.student_id
-    ORDER BY a.attendance_date DESC,s.name`).all();
-  res.json({rows});
-});
-app.patch("/api/admin/attendance/:id", admin, (req,res)=>{
-  const status=String(req.body.status||"");
-  if(!["Present","Absent"].includes(status)) return res.status(400).json({error:"Invalid status."});
-  db.prepare("UPDATE attendance SET status=? WHERE id=?").run(status,req.params.id);
-  res.json({ok:true});
+
+  const rows = db
+    .prepare(
+      `
+      SELECT
+        attendance_id,
+        date,
+        status,
+        marked_time
+      FROM attendance
+      WHERE student_id=?
+      ORDER BY date DESC
+      `
+    )
+    .all(req.session.user.id);
+
+  res.json({
+    rows,
+    stats: getStats(
+      req.session.user.id
+    )
+  });
 });
 
-app.get("*", (req,res)=>{
-  if(req.path.startsWith("/api/")) return res.status(404).json({error:"Not found"});
-  res.sendFile(path.join(__dirname,"public","index.html"));
-});
+// =========================
+// CLASS OVERVIEW
+// Aggregate only
+// =========================
 
-app.listen(PORT, "0.0.0.0", ()=>console.log(`AttendEase running at http://localhost:${PORT}`));
+app.get("/api/overview", requireLogin, (req, res) => {
+  const students = db
+    .

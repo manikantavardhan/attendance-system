@@ -1,3 +1,0 @@
-function localDate(){let d=new Date(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return `${d.getFullYear()}-${m}-${day}`}document.querySelector("#today").textContent=new Date().toLocaleDateString();
-async function mark(status){let r=await fetch("/api/my-attendance",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({date:localDate(),status})}),d=await r.json();let m=document.querySelector("#msg");m.textContent=r.ok?`✓ Today marked ${status}.`:d.error||"Could not save.";m.className=r.ok?"success":"danger";if(r.ok)setTimeout(()=>location.href="/dashboard.html",700)}
-async function logout(){await fetch("/api/logout",{method:"POST"});location.href="/"}
